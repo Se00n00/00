@@ -1,69 +1,55 @@
-import Image from "next/image";
+"use client";
+
+import { useEffect } from "react";
+import { useVoiceAgent } from "@/hooks/useVoiceAgent";
+import type { ChatMsg } from "@/hooks/useVoiceAgent";
+import Equalizer from "@/components/Equalizer";
+import Conversation from "@/components/Conversation";
 
 export default function Home() {
+  const v = useVoiceAgent();
+
+  // belt + suspenders vs zoom: Safari pinch gesture + desktop ctrl/trackpad zoom
+  useEffect(() => {
+    const stopGesture = (e: Event) => e.preventDefault();
+    const stopCtrlWheel = (e: WheelEvent) => {
+      if (e.ctrlKey) e.preventDefault();
+    };
+    document.addEventListener("gesturestart", stopGesture);
+    document.addEventListener("wheel", stopCtrlWheel, { passive: false });
+    return () => {
+      document.removeEventListener("gesturestart", stopGesture);
+      document.removeEventListener("wheel", stopCtrlWheel);
+    };
+  }, []);
+
+  const handleTap = () => {
+    if (v.status === "requesting") return;
+    v.resumeAudio();
+    v.toggle();
+  };
+
+  // Mic errors surface as talk text (UI stays 3 elements only).
+  const display: ChatMsg[] = v.error
+    ? [...v.messages, { id: "__mic-error", role: "agent", text: v.error, ts: 0 }]
+    : v.messages;
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
+    <div
+      onClick={handleTap}
+      onContextMenu={(e) => e.preventDefault()}
+      title="tap to talk / mute"
+      className="relative flex min-h-screen w-full cursor-pointer flex-col overflow-x-hidden bg-black text-white select-none lg:flex-row"
+    >
+      {/* 1st thing: disappearing talk — near full-bleed white card */}
+      <section className="flex w-full min-w-0 flex-none items-center justify-center lg:min-h-screen lg:flex-1 lg:items-stretch">
+        <Conversation messages={display} interim={v.interim} />
+      </section>
+
+      {/* 2nd thing: equalizer — right on desktop, down on mobile */}
+      <aside className="flex w-full min-w-0 flex-none items-center justify-center px-5 pt-2 pb-10 sm:px-8 lg:min-h-screen lg:flex-1 lg:pb-6 lg:pr-16">
+        <Equalizer analyserRef={v.analyserRef} active={v.status === "live" && v.micOn} agentSpeaking={v.agentSpeaking} />
+      </aside>
     </div>
   );
 }
