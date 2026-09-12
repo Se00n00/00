@@ -23,7 +23,7 @@ function LatencyGraph({ history, quality }: { history: number[]; quality: string
   const lastIdx = history.length - 1;
 
   return (
-    <div className="w-40 shrink-0 rounded-xs bg-red-500 p-1">
+    <div className="w-40 shrink-0 rounded-xs bg-red-500/30 border border-white/30 p-1">
       <div className="rounded-xs bg-white px-2 py-1">
         <div className="h-4 w-full">
           <ResponsiveContainer width="100%" height="100%">
@@ -63,7 +63,7 @@ export default function StatusStrip() {
 
       <LatencyGraph history={history} quality={quality} />
 
-      <span className="bg-amber-300 p-1 rounded-xs">
+      <span className="bg-amber-300/30 border border-white/30 p-1 rounded-xs">
         <span className="flex items-center gap-[3px] " title={`${used}/${SLOTS} slots in use`}>
           {Array.from({ length: SLOTS }).map((_, i) => (
             <span
