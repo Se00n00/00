@@ -1,6 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  EngineError,
+  bufferToWavBlob,
+  engineReady,
+  pcmB64ToBuffer,
+  playThroughAnalyser,
+  voiceTurn,
+} from "@/lib/backend";
 
 export type ChatMsg = {
   id: string;
@@ -12,28 +20,13 @@ export type ChatMsg = {
 
 export type VoiceStatus = "idle" | "requesting" | "live" | "error";
 
-const WS_URL = process.env.NEXT_PUBLIC_VOICE_WS_URL ?? "";
-
-const AGENT_REPLIES = [
-  "Got you — streaming your voice to the agent in real time. Keep talking, I'm with you.",
-  "Heard that loud and clear. The server is piping audio both ways with low latency.",
-  "Nice — I can see your levels moving on the equalizer. What should we dive into next?",
-  "Copy that. I'm the live voice agent — your mic streams up, my voice streams back.",
-];
-
-type SpeechRecognitionAlternative = { transcript: string };
-type SpeechRecognitionResultLike = { isFinal: boolean; 0: SpeechRecognitionAlternative };
-type SpeechRecognitionEventLike = { resultIndex: number; results: SpeechRecognitionResultLike[] };
-type SpeechRecognitionInstance = {
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: ((ev: SpeechRecognitionEventLike) => void) | null;
-  onerror: (() => void) | null;
-  start: () => void;
-  stop: () => void;
-};
-type SpeechRecognitionCtor = new () => SpeechRecognitionInstance;
+// VAD turn-taking: speech onset starts a recording, ~1.2s of silence ends it.
+const VAD_TICK_MS = 120;
+const VAD_ONSET_RMS = 0.025;
+const VAD_OFFSET_RMS = 0.015;
+const VAD_SILENCE_MS = 1200;
+const VAD_MIN_TURN_MS = 800;
+const VAD_MAX_TURN_MS = 55000;
 
 function uid() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -55,81 +48,136 @@ export function useVoiceAgent() {
   ]);
   const [interim, setInterim] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
-  const [muted, setMuted] = useState(false);
-  const mutedRef = useRef(false);
+  const [backendLive, setBackendLive] = useState(false);
 
   const streamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const agentAnalyserRef = useRef<AnalyserNode | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
-  const replyIdx = useRef(0);
-  const agentTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // server-turn plumbing
+  const backendRef = useRef(false);
+  const vadTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const vadBuf = useRef<Uint8Array | null>(null);
+  const turnRef = useRef<{ active: boolean; silentMs: number; startedAt: number; chunks: Blob[] }>({
+    active: false,
+    silentMs: 0,
+    startedAt: 0,
+    chunks: [],
+  });
+  const inFlight = useRef(false);
+  const playStop = useRef<(() => void) | null>(null);
+  const lastNoteAt = useRef(0);
 
-  // ---- agent reply (local simulation; replace with real server stream) ----
-  const streamAgentReply = useCallback((prompt: string) => {
-    const full =
-      prompt.trim().length > 0
-        ? `You said: "${prompt.slice(0, 120)}" — ${AGENT_REPLIES[replyIdx.current++ % AGENT_REPLIES.length]}`
-        : AGENT_REPLIES[replyIdx.current++ % AGENT_REPLIES.length];
-
-    const id = uid();
-    setAgentSpeaking(true);
-    setMessages((m) => [...m, { id, role: "agent", text: "", ts: Date.now(), streaming: true }]);
-
-    // word-by-word streaming to mimic server -> client audio/text stream
-    const words = full.split(" ");
-    let i = 0;
-    const timer = setInterval(() => {
-      i += 1;
-      const slice = words.slice(0, i).join(" ");
-      setMessages((m) => m.map((msg) => (msg.id === id ? { ...msg, text: slice } : msg)));
-      if (i >= words.length) {
-        clearInterval(timer);
-        setMessages((m) => m.map((msg) => (msg.id === id ? { ...msg, streaming: false } : msg)));
-        setAgentSpeaking(false);
-        // speak back so the equalizer shows "agent" energy.
-        // onend is unreliable (may never fire) so a timeout guarantees
-        // the flag — and the gray bars — always settle afterwards.
-        try {
-          if (agentTimer.current) clearTimeout(agentTimer.current);
-          if (!mutedRef.current && "speechSynthesis" in window) {
-            window.speechSynthesis.cancel();
-            const u = new SpeechSynthesisUtterance(full);
-            u.rate = 1.05;
-            const done = () => {
-              setAgentSpeaking(false);
-              if (agentTimer.current) clearTimeout(agentTimer.current);
-            };
-            u.onend = done;
-            u.onerror = done;
-            window.speechSynthesis.speak(u);
-            setAgentSpeaking(true);
-            agentTimer.current = setTimeout(done, Math.min(15000, 1500 + words.length * 350));
-          }
-        } catch {
-          /* no tts */
-        }
-      }
-    }, 90);
+  const stopPlayback = useCallback(() => {
+    try {
+      playStop.current?.();
+    } catch {}
+    playStop.current = null;
   }, []);
 
-  const handleUserFinal = useCallback(
-    (text: string) => {
-      const t = text.trim();
-      if (!t) return;
-      setInterim("");
-      setMessages((m) => [...m, { id: uid(), role: "user", text: t, ts: Date.now() }]);
-      // If a real WS server is attached it will respond via ws.onmessage.
-      // Otherwise simulate the server voice-agent locally.
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        setTimeout(() => streamAgentReply(t), 450);
+  const noteFailure = useCallback((text: string) => {
+    // don't spam the talk on repeated failures — one note per 10s max
+    const now = Date.now();
+    if (now - lastNoteAt.current < 10000) return;
+    lastNoteAt.current = now;
+    setMessages((m) => [...m, { id: uid(), role: "agent", text, ts: now }]);
+  }, []);
+
+  // One server turn: utterance audio -> engine -> text bubbles + real playback.
+  // No local fallback: if the engine fails, the failure itself is shown.
+  const processTurn = useCallback(
+    async (blob: Blob) => {
+      const ctx = audioCtxRef.current;
+      if (!ctx || blob.size < 3000) return;
+      if (inFlight.current) return;
+      inFlight.current = true;
+      try {
+        const decoded = await ctx.decodeAudioData(await blob.arrayBuffer());
+        const turn = await voiceTurn(bufferToWavBlob(decoded));
+        if (turn.text?.trim()) {
+          setMessages((m) => [...m, { id: uid(), role: "user", text: turn.text.trim(), ts: Date.now() }]);
+        }
+        const reply = (turn.reply ?? "").trim();
+        if (reply) {
+          setMessages((m) => [...m, { id: uid(), role: "agent", text: reply, ts: Date.now() }]);
+        }
+        if (turn.wav_b64) {
+          const an = agentAnalyserRef.current;
+          if (an) {
+            stopPlayback();
+            setAgentSpeaking(true);
+            const h = playThroughAnalyser(ctx, an, pcmB64ToBuffer(ctx, turn.wav_b64));
+            playStop.current = h.stop;
+            await h.ended;
+            setAgentSpeaking(false);
+          }
+        }
+      } catch (e) {
+        if (e instanceof EngineError) {
+          noteFailure(e.code === 503 ? "engine busy — tap to retry" : `engine ${e.code}: ${e.message}`.slice(0, 120));
+        } else {
+          noteFailure("engine unreachable — tap to retry");
+        }
+      } finally {
+        inFlight.current = false;
       }
     },
-    [streamAgentReply]
+    [stopPlayback, noteFailure]
   );
+
+  const tickVad = useCallback(() => {
+    const an = analyserRef.current;
+    const ctx = audioCtxRef.current;
+    if (!an || !ctx || ctx.state !== "running") return;
+    if (!vadBuf.current || vadBuf.current.length !== an.fftSize) {
+      vadBuf.current = new Uint8Array(an.fftSize);
+    }
+    const td = vadBuf.current;
+    an.getByteTimeDomainData(td as Uint8Array<ArrayBuffer>);
+    let sum = 0;
+    for (let i = 0; i < td.length; i++) {
+      const v = (td[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / td.length);
+    const t = turnRef.current;
+
+    if (!t.active) {
+      if (rms > VAD_ONSET_RMS && !inFlight.current) {
+        try {
+          const mime = ["audio/webm;codecs=opus", "audio/webm"].find((m) =>
+            typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(m)
+          );
+          const rec = mime ? new MediaRecorder(streamRef.current!, { mimeType: mime }) : new MediaRecorder(streamRef.current!);
+          t.chunks = [];
+          rec.ondataavailable = (e) => {
+            if (e.data.size > 0) t.chunks.push(e.data);
+          };
+          rec.onstop = () => {
+            recorderRef.current = null;
+            void processTurn(new Blob(t.chunks, { type: rec.mimeType || "audio/webm" }));
+          };
+          recorderRef.current = rec;
+          rec.start();
+          t.active = true;
+          t.silentMs = 0;
+          t.startedAt = Date.now();
+        } catch {
+          /* recorder unavailable — STT/demo path still works */
+        }
+      }
+    } else {
+      t.silentMs = rms < VAD_OFFSET_RMS ? t.silentMs + VAD_TICK_MS : 0;
+      const dur = Date.now() - t.startedAt;
+      if ((t.silentMs >= VAD_SILENCE_MS && dur > VAD_MIN_TURN_MS) || dur > VAD_MAX_TURN_MS) {
+        t.active = false;
+        try {
+          recorderRef.current?.stop();
+        } catch {}
+      }
+    }
+  }, [processTurn]);
 
   const start = useCallback(async () => {
     setError(null);
@@ -173,79 +221,29 @@ export function useVoiceAgent() {
       setMicOn(true);
       setStatus("live");
 
-      // ---- stream mic chunks to voice-agent server if configured ----
-      // Server contract: accept binary audio blobs (webm/opus),
-      // send back JSON { type:'transcript', role:'user'|'agent', text } and/or binary audio.
-      if (WS_URL) {
-        try {
-          const ws = new WebSocket(WS_URL);
-          wsRef.current = ws;
-          ws.onopen = () => setWsConnected(true);
-          ws.onclose = () => setWsConnected(false);
-          ws.onerror = () => setWsConnected(false);
-          ws.onmessage = (ev) => {
-            try {
-              const data = JSON.parse(ev.data);
-              if (data.type === "transcript" && data.text) {
-                if (data.role === "user") handleUserFinal(String(data.text));
-                else {
-                  setMessages((m) => [
-                    ...m,
-                    { id: uid(), role: "agent", text: String(data.text), ts: Date.now() },
-                  ]);
-                }
-              }
-            } catch {
-              // binary audio from server -> could decode & play here
-            }
-          };
-          const rec = new MediaRecorder(stream, { mimeType: "audio/webm" });
-          recorderRef.current = rec;
-          rec.ondataavailable = (e) => {
-            if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) ws.send(e.data);
-          };
-          rec.start(250); // 250ms chunks = realtime stream
-        } catch {
-          /* fall back to local only */
-        }
-      }
+      // Dedicated analyser for engine playback -> drives gray bars for real.
+      const agentAn = ctx.createAnalyser();
+      agentAn.fftSize = 256;
+      agentAn.smoothingTimeConstant = 0.8;
+      agentAnalyserRef.current = agentAn;
 
-      // ---- live interim transcripts (browser STT; server would do this in prod) ----
-      const win2 = window as unknown as Record<string, unknown>;
-      const SR = (win2.SpeechRecognition as SpeechRecognitionCtor | undefined) ??
-        (win2.webkitSpeechRecognition as SpeechRecognitionCtor | undefined);
-      if (SR) {
-        const rec = new SR();
-        rec.continuous = true;
-        rec.interimResults = true;
-        rec.lang = "en-US";
-        rec.onresult = (ev: SpeechRecognitionEventLike) => {
-          let interimTxt = "";
-          let finalTxt = "";
-          for (let i = ev.resultIndex; i < ev.results.length; i++) {
-            const r = ev.results[i];
-            if (r.isFinal) finalTxt += r[0].transcript;
-            else interimTxt += r[0].transcript;
-          }
-          if (interimTxt) setInterim(interimTxt);
-          if (finalTxt) handleUserFinal(finalTxt);
-        };
-        rec.onerror = () => {};
-        try {
-          rec.start();
-        } catch {}
-        recognitionRef.current = rec;
-      } else {
-        // no browser STT -> demo echo so UI still feels realtime
-        setInterim("listening…");
-        setTimeout(() => streamAgentReply("hello"), 1200);
+      // Engine check: VAD turns only run when it is ready.
+      // No fallback: without the engine there is no recognition or speech —
+      // the strip + talk show the outage instead of faking it.
+      const ready = await engineReady();
+      backendRef.current = ready;
+      setBackendLive(ready);
+      if (!ready) {
+        setError("engine offline — tap to retry");
+      } else if (!vadTimer.current) {
+        vadTimer.current = setInterval(tickVad, VAD_TICK_MS);
       }
     } catch (e: unknown) {
       setStatus("error");
       const msg = e instanceof Error ? e.message : "Microphone blocked. Allow mic access and retry.";
       setError(msg);
     }
-  }, [handleUserFinal, streamAgentReply]);
+  }, [tickVad]);
 
   // Re-run from any tap: if the context is still suspended, a tap-gesture
   // resume is the only thing that unlocks real mic levels.
@@ -256,48 +254,28 @@ export function useVoiceAgent() {
     }
   }, []);
 
-  const toggleMute = useCallback(() => {
-    setMuted((m) => {
-      const next = !m;
-      mutedRef.current = next;
-      if (next) {
-        try {
-          if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-        } catch {}
-      }
-      return next;
-    });
-  }, []);
-
   const stop = useCallback(() => {
-    if (agentTimer.current) clearTimeout(agentTimer.current);
-    try {
-      recognitionRef.current?.stop?.();
-    } catch {}
+    if (vadTimer.current) clearInterval(vadTimer.current);
+    vadTimer.current = null;
+    stopPlayback();
+    turnRef.current = { active: false, silentMs: 0, startedAt: 0, chunks: [] };
+    inFlight.current = false;
+    backendRef.current = false;
     try {
       recorderRef.current?.stop();
     } catch {}
-    try {
-      wsRef.current?.close();
-    } catch {}
     streamRef.current?.getTracks().forEach((t) => t.stop());
     audioCtxRef.current?.close().catch(() => {});
-    try {
-      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
-    } catch {}
     streamRef.current = null;
     analyserRef.current = null;
+    agentAnalyserRef.current = null;
     recorderRef.current = null;
-    wsRef.current = null;
-    recognitionRef.current = null;
     setMicOn(false);
     setAgentSpeaking(false);
     setInterim("");
-    setWsConnected(false);
-    setMuted(false);
-    mutedRef.current = false;
+    setBackendLive(false);
     setStatus("idle");
-  }, []);
+  }, [stopPlayback]);
 
   useEffect(() => () => stop(), [stop]);
 
@@ -308,15 +286,12 @@ export function useVoiceAgent() {
     messages,
     interim,
     error,
-    wsConnected,
-    muted,
-    wsUrl: WS_URL,
+    backendLive,
     analyserRef,
+    agentAnalyserRef,
     start,
     stop,
     resumeAudio,
-    toggleMute,
     toggle: () => (status === "live" ? stop() : start()),
-    sendText: handleUserFinal,
   };
 }

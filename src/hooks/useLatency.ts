@@ -5,26 +5,38 @@ import { useEffect, useState } from "react";
 export type LatencyQuality = "low" | "mid" | "high";
 
 const MAX_HISTORY = 30;
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8003";
 
-// Simulated RTT (~23ms base with jitter + rare spikes).
-// When the voice-agent server is wired (NEXT_PUBLIC_VOICE_WS_URL),
-// replace the ticker with real ping/pong RTT over that socket.
+// Real RTT to the engine (/health), sampled continuously.
+// No simulated fallback: when the engine is unreachable the readout shows
+// the outage (0ms flatline + red) instead of fake numbers.
 export function useLatency() {
-  const [history, setHistory] = useState<number[]>([23]);
+  const [history, setHistory] = useState<number[]>([0]);
+  const [online, setOnline] = useState(false);
 
   useEffect(() => {
-    const id = setInterval(() => {
-      const r = Math.random();
-      const sample =
-        r > 0.93
-          ? 140 + Math.random() * 60 // occasional spike
-          : 18 + Math.random() * 22 + Math.sin(Date.now() / 9000) * 4;
-      setHistory((h) => [...h.slice(-(MAX_HISTORY - 1)), Math.round(sample)]);
-    }, 1000);
+    const tick = async () => {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 1500);
+        const t0 = performance.now();
+        const res = await fetch(`${API_BASE}/health`, { signal: ctrl.signal });
+        clearTimeout(t);
+        if (!res.ok) throw new Error(`health ${res.status}`);
+        setOnline(true);
+        const ms = Math.max(1, Math.round(performance.now() - t0));
+        setHistory((h) => [...h.slice(-(MAX_HISTORY - 1)), ms]);
+      } catch {
+        setOnline(false);
+        setHistory((h) => [...h.slice(-(MAX_HISTORY - 1)), 0]);
+      }
+    };
+    void tick();
+    const id = setInterval(() => void tick(), 2000);
     return () => clearInterval(id);
   }, []);
 
-  const ms = history[history.length - 1] ?? 23;
-  const quality: LatencyQuality = ms < 60 ? "low" : ms < 150 ? "mid" : "high";
-  return { ms, history, quality };
+  const ms = history[history.length - 1] ?? 0;
+  const quality: LatencyQuality = !online || ms <= 0 ? "high" : ms < 60 ? "low" : ms < 150 ? "mid" : "high";
+  return { ms, history, quality, online };
 }
